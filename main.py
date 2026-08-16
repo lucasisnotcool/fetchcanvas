@@ -1,6 +1,12 @@
-import requests
+import json
 import os
-from datetime import datetime, timezone
+import re
+import time
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+import requests
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 
@@ -13,6 +19,15 @@ OUTPUT_PATH = os.getenv('OUTPUT_PATH')
 CHANGELOG_NAME = "CHANGELOG.md"
 TIMEZONE = ZoneInfo("Asia/Singapore")
 LAST_SYNC_PREFIX = "# Last Sync: "
+EVENT_MARKER_RE = re.compile(r"<!-- fetchcanvas-event: ([0-9a-f-]+) -->")
+REQUEST_TIMEOUT = 30
+DOWNLOAD_TIMEOUT = 120
+RETRY_DELAYS = (0, 2, 5, 10)
+METADATA_DEFERRED_EXIT_CODE = 10
+
+LOCAL_STATE_DIR = Path.home() / ".fetchcanvas"
+PENDING_CHANGELOG_PATH = LOCAL_STATE_DIR / "pending-changelog.md"
+RUN_STATE_PATH = LOCAL_STATE_DIR / "last-run.json"
 
 _raw_courses = (os.getenv('COURSES') or '').strip()
 if not _raw_courses or _raw_courses.lower() == 'all':
@@ -27,9 +42,19 @@ headers = {
 }
 
 
+def get_json(url):
+    """Fetch and validate a Canvas JSON response with a bounded timeout."""
+    response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+    try:
+        return response.json()
+    except ValueError as e:
+        raise RuntimeError(f"Canvas returned invalid JSON for {url}") from e
+
+
 def get_all_courses():
     url = f"{CANVAS_BASE_URL}/api/v1/courses?enrollment_state=active&per_page=100"
-    course_list = requests.get(url, headers=headers).json()
+    course_list = get_json(url)
     courses = []
     for course in course_list:
         if "course_code" in course:
@@ -45,7 +70,7 @@ def get_all_folders(course_id, course_name):
     """
     url = f"{CANVAS_BASE_URL}/api/v1/courses/{course_id}/folders?per_page=100"
 
-    folder_list = requests.get(url, headers=headers).json()
+    folder_list = get_json(url)
 
     folder_id_name_map = {}
     for folder in folder_list:
@@ -62,21 +87,33 @@ def get_all_folders(course_id, course_name):
 
 
 def download_file(url, save_path):
+    temp_path = f"{save_path}.fetchcanvas.tmp"
     try:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        response = requests.get(url, stream=True)
+        response = requests.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT)
         response.raise_for_status()
-        with open(save_path, 'wb') as file:
+        # Never leave a partially downloaded course file visible in OneDrive.
+        with open(temp_path, 'wb') as file:
             for chunk in response.iter_content(chunk_size=8192):
                 file.write(chunk)
+        os.replace(temp_path, save_path)
         return True, None
-    except requests.exceptions.RequestException as e:
+    except (requests.exceptions.RequestException, OSError) as e:
+        try:
+            os.remove(temp_path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
         return False, str(e)
 
-def build_run_entry(run_started_at, courses_log):
+def build_run_entry(run_started_at, courses_log, event_id):
     run_time = run_started_at.astimezone(TIMEZONE)
     ts_str = run_time.strftime("%A %Y-%m-%d %H:%M:%S %Z")
     lines = []
+    # This marker makes deferred publication idempotent if a cloud write's
+    # completion is uncertain when the File Provider drops the connection.
+    lines.append(f"<!-- fetchcanvas-event: {event_id} -->")
     lines.append(f"## Sync run at {ts_str}")
     lines.append("")
     for course_code, summary_lines in courses_log:
@@ -88,43 +125,128 @@ def build_run_entry(run_started_at, courses_log):
     return "\n".join(lines)
 
 
-def update_changelog(output_path, run_started_at, entry_md_or_none):
-    """Update Last Sync header and optionally prepend a new entry."""
-    changelog_path = os.path.join(output_path, CHANGELOG_NAME)
-    os.makedirs(output_path, exist_ok=True)
+def _atomic_write_text(path, contents):
+    """Replace a file without ever truncating its previous version in place."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f".{path.name}.fetchcanvas.tmp")
+    with open(temp_path, "w", encoding="utf-8") as f:
+        f.write(contents)
+    os.replace(temp_path, path)
 
-    # Format Last Sync line 
+
+def load_pending_changelog():
+    try:
+        return PENDING_CHANGELOG_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+    except OSError as e:
+        raise RuntimeError(f"Could not read local changelog outbox: {e}") from e
+
+
+def save_pending_changelog(entries):
+    """Keep unpublished entries locally until OneDrive accepts them."""
+    try:
+        _atomic_write_text(PENDING_CHANGELOG_PATH, entries)
+        return True, None
+    except OSError as e:
+        return False, str(e)
+
+
+def clear_pending_changelog():
+    try:
+        PENDING_CHANGELOG_PATH.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def unpublished_entries(entries, existing):
+    """Drop queued event blocks that are already present in the remote log."""
+    published_ids = set(EVENT_MARKER_RE.findall(existing))
+    if not published_ids:
+        return entries
+
+    blocks = list(re.finditer(
+        r"(?s)(<!-- fetchcanvas-event: ([0-9a-f-]+) -->.*?)(?=<!-- fetchcanvas-event: |\Z)",
+        entries,
+    ))
+    if not blocks:
+        # Compatibility with an outbox created by an older FetchCanvas build.
+        return entries
+    return "".join(block.group(1) for block in blocks if block.group(2) not in published_ids)
+
+
+def write_local_run_state(run_started_at, course_results, changelog_status, upcoming_status):
+    """Record the authoritative run result outside the OneDrive File Provider."""
+    payload = {
+        "last_canvas_sync": run_started_at.isoformat(),
+        "courses": {
+            result["course_code"]: {
+                "downloaded": len(result["downloaded"]),
+                "updated": len(result["updated"]),
+                "skipped": len(result["skipped"]),
+                "failed": len(result["failed"]),
+            }
+            for result in course_results
+        },
+        "changelog": changelog_status,
+        "upcoming": upcoming_status,
+    }
+    try:
+        _atomic_write_text(RUN_STATE_PATH, json.dumps(payload, indent=2) + "\n")
+        return True, None
+    except OSError as e:
+        return False, str(e)
+
+
+def update_changelog(output_path, run_started_at, entry_md):
+    """Publish queued changelog entries atomically, with bounded retries."""
+    changelog_path = os.path.join(output_path, CHANGELOG_NAME)
+
+    # Format Last Sync line.
     run_time = run_started_at.astimezone(TIMEZONE)
     last_sync_str = run_time.strftime("%A %Y-%m-%d %H:%M:%S %Z")
     header_line = f"{LAST_SYNC_PREFIX}{last_sync_str}\n\n"
 
-    old_body = ""
-    if os.path.exists(changelog_path):
-        with open(changelog_path, "r", encoding="utf-8") as f:
-            existing = f.read()
-        # Strip old Last Sync header if present
-        if existing.startswith(LAST_SYNC_PREFIX):
-            # Remove first line and any following blank line(s)
-            lines = existing.splitlines(True)
-            # drop first line
-            lines = lines[1:]
-            # drop leading blank lines
-            while lines and lines[0].strip() == "":
-                lines.pop(0)
-            old_body = "".join(lines)
-        else:
-            old_body = existing
+    last_error = None
+    for attempt, delay in enumerate(RETRY_DELAYS, start=1):
+        if delay:
+            print(f"Retrying changelog update in {delay}s (attempt {attempt}/{len(RETRY_DELAYS)}).")
+            time.sleep(delay)
+        try:
+            existing = ""
+            old_body = ""
+            try:
+                with open(changelog_path, "r", encoding="utf-8") as f:
+                    existing = f.read()
+            except FileNotFoundError:
+                pass
+            # Strip old Last Sync header if present.
+            if existing.startswith(LAST_SYNC_PREFIX):
+                lines = existing.splitlines(True)[1:]
+                while lines and lines[0].strip() == "":
+                    lines.pop(0)
+                old_body = "".join(lines)
+            else:
+                old_body = existing
 
-    with open(changelog_path, "w", encoding="utf-8") as f:
-        f.write(header_line)
-        if entry_md_or_none:
-            f.write(entry_md_or_none)
-            if old_body:
-                f.write(old_body)
-        else:
-            # No new entry; just keep existing body as-is
-            if old_body:
-                f.write(old_body)
+            entries_to_add = unpublished_entries(entry_md, existing)
+            if not entries_to_add:
+                return True, None
+
+            new_body = header_line
+            new_body += entries_to_add
+            new_body += old_body
+
+            # Do not truncate the existing changelog in place on a cloud volume.
+            _atomic_write_text(changelog_path, new_body)
+            return True, None
+        except OSError as e:
+            last_error = str(e)
+            print(f"Changelog update attempt {attempt}/{len(RETRY_DELAYS)} failed: {e}")
+
+    print(f"Changelog publication deferred: {changelog_path}")
+    return False, last_error or "Unknown OneDrive error"
 
 def resolve_path_for_file(folder_id, folder_id_name_map):
     """
@@ -143,7 +265,7 @@ def resolve_path_for_file(folder_id, folder_id_name_map):
 
 def download_all_files(course_id, folder_id_name_map, course_code):
     url = f"{CANVAS_BASE_URL}/api/v1/courses/{course_id}/files?per_page=100"
-    file_list = requests.get(url, headers=headers).json()
+    file_list = get_json(url)
 
     downloaded = []
     updated = []
@@ -155,7 +277,17 @@ def download_all_files(course_id, folder_id_name_map, course_code):
         folder_path = resolve_path_for_file(file['folder_id'], folder_id_name_map)
         save_path = os.path.join(OUTPUT_PATH, folder_path, display_name)
 
-        if not os.path.exists(save_path):
+        try:
+            local_stat = os.stat(save_path)
+            exists = True
+        except FileNotFoundError:
+            exists = False
+            local_stat = None
+        except OSError as e:
+            failed.append((display_name, folder_path, str(e)))
+            continue
+
+        if not exists:
             ok, err = download_file(file['url'], save_path)
             if ok:
                 downloaded.append((display_name, folder_path))
@@ -170,7 +302,7 @@ def download_all_files(course_id, folder_id_name_map, course_code):
         except (KeyError, ValueError):
             canvas_updated = float('inf')
 
-        local_mtime = os.path.getmtime(save_path)
+        local_mtime = local_stat.st_mtime
         if canvas_updated > local_mtime:
             ok, err = download_file(file['url'], save_path)
             if ok:
@@ -233,15 +365,17 @@ def format_course_summary(course_result):
 
     return lines
 
+def run():
+    if not OUTPUT_PATH:
+        raise RuntimeError("OUTPUT_PATH is missing from .env")
 
-
-if __name__ == "__main__":
     run_started_at = datetime.now(TIMEZONE)
     courses = get_all_courses()
 
     print(f"Syncing courses: {COURSE_CODES if not SYNC_ALL_COURSES else 'all'}")
 
     courses_log = []
+    course_results = []
     any_changes_or_errors = False
 
     for course_id, course_code in courses:
@@ -251,6 +385,7 @@ if __name__ == "__main__":
         print(f"\nCourse: {course_code}")
         folder_id_name_map = get_all_folders(course_id, course_code)
         result = download_all_files(course_id, folder_id_name_map, course_code)
+        course_results.append(result)
         summary_lines = format_course_summary(result)
 
         if summary_lines is None:
@@ -261,10 +396,78 @@ if __name__ == "__main__":
                 print(line)
             courses_log.append((course_code, summary_lines))
 
-    # Decide whether to add a per-run entry
+    # Only touch the cloud changelog when there is new information to publish.
+    # A no-change Canvas run must not depend on a potentially evicted OneDrive file.
     if any_changes_or_errors:
-        entry_md = build_run_entry(run_started_at, courses_log)
+        fresh_entry = build_run_entry(run_started_at, courses_log, str(uuid.uuid4()))
     else:
-        entry_md = None  # no new log entry
+        fresh_entry = ""
 
-    update_changelog(OUTPUT_PATH, run_started_at, entry_md)
+    pending_entry = load_pending_changelog()
+    entries_to_publish = fresh_entry + pending_entry
+    changelog_status = {"status": "not_needed", "error": None}
+    if entries_to_publish:
+        # Persist before attempting the cloud write, so a connection failure can
+        # never lose a record of downloaded, updated, or failed course files.
+        queued, queue_error = save_pending_changelog(entries_to_publish)
+        if not queued:
+            changelog_status = {
+                "status": "deferred_outbox_write_failed",
+                "error": f"local outbox: {queue_error}",
+            }
+        else:
+            changelog_ok, changelog_error = update_changelog(
+                OUTPUT_PATH, run_started_at, entries_to_publish
+            )
+            if changelog_ok:
+                try:
+                    clear_pending_changelog()
+                    changelog_status = {"status": "published", "error": None}
+                except OSError as e:
+                    # A later run will detect the event marker and avoid duplication.
+                    changelog_status = {"status": "published_outbox_cleanup_failed", "error": str(e)}
+            else:
+                changelog_status = {"status": "deferred", "error": changelog_error}
+
+    # --- Second Brain: upcoming assignments tracker (added 2026-08-12 by Claude) ---
+    upcoming_status = {"status": "not_run", "error": None}
+    try:
+        import fetch_upcoming
+        upcoming_result = fetch_upcoming.main()
+        upcoming_status = {
+            "status": (
+                "published"
+                if upcoming_result["ok"] and upcoming_result.get("targets")
+                else ("unchanged" if upcoming_result["ok"] else "deferred")
+            ),
+            "error": upcoming_result.get("error"),
+        }
+    except Exception as e:
+        print(f"[fetch_upcoming] skipped due to error: {e}")
+        upcoming_status = {"status": "deferred", "error": str(e)}
+
+    state_ok, state_error = write_local_run_state(
+        run_started_at, course_results, changelog_status, upcoming_status
+    )
+    if not state_ok:
+        print(f"[fetchcanvas] could not record local run state: {state_error}")
+
+    content_failures = sum(len(result["failed"]) for result in course_results)
+    if content_failures:
+        print(f"FetchCanvas completed with {content_failures} course-file failure(s).")
+        return 1
+
+    metadata_deferred = (
+        changelog_status["status"] not in {"not_needed", "published"}
+        or upcoming_status["status"] == "deferred"
+        or not state_ok
+    )
+    if metadata_deferred:
+        print("Canvas sync completed; OneDrive metadata is deferred. See ~/.fetchcanvas/last-run.json.")
+        return METADATA_DEFERRED_EXIT_CODE
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(run())
