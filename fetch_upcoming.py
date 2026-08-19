@@ -29,7 +29,11 @@ API_TOKEN = os.getenv("API_TOKEN")
 CANVAS_BASE_URL = os.getenv("CANVAS_BASE_URL", "https://canvas.nus.edu.sg")
 OUTPUT_PATH = (os.getenv("OUTPUT_PATH") or "").strip()
 SGT = ZoneInfo("Asia/Singapore")
-VAULT = os.path.expanduser("~/Documents/SecondBrain")
+# Moved into the OneDrive replica 2026-08-19 so the vault bridge carries it to gram-server
+# (05-ROADMAP §5 ask #4). Was ~/Documents/SecondBrain, which never reached the server.
+VAULT = os.path.expanduser(
+    "~/Library/CloudStorage/OneDrive-NationalUniversityofSingapore/SecondBrain"
+)
 
 _raw = (os.getenv("COURSES") or "").strip()
 COURSE_FILTER = None if not _raw or _raw.lower() == "all" else {c.strip() for c in _raw.split(",") if c.strip()}
@@ -47,6 +51,26 @@ def _get(url, params=None):
     return r.json()
 
 
+def _get_paginated(url, params=None):
+    """GET every page. Canvas paginates with RFC 5988 Link headers; reading only the
+    first page silently loses everything past per_page (100) with no error. Fixed here
+    2026-08-19 to match the server port in projects/second-brain/scripts/canvas-upcoming.py.
+    """
+    out = []
+    r = requests.get(url, headers=HEADERS, params=params or {}, timeout=TIMEOUT)
+    while True:
+        r.raise_for_status()
+        page = r.json()
+        if not isinstance(page, list):
+            return page
+        out.extend(page)
+        nxt = r.links.get("next", {}).get("url")
+        if not nxt:
+            return out
+        # The next URL already carries the query string; do not re-send params.
+        r = requests.get(nxt, headers=HEADERS, timeout=TIMEOUT)
+
+
 def _parse_dt(s):
     if not s:
         return None
@@ -57,8 +81,8 @@ def _parse_dt(s):
 
 
 def collect():
-    courses = _get(f"{CANVAS_BASE_URL}/api/v1/courses",
-                   {"enrollment_state": "active", "per_page": 100})
+    courses = _get_paginated(f"{CANVAS_BASE_URL}/api/v1/courses",
+                             {"enrollment_state": "active", "per_page": 100})
     now = datetime.now(SGT)
     items = []
     errors = []
@@ -67,7 +91,7 @@ def collect():
         if not code or (COURSE_FILTER and code not in COURSE_FILTER):
             continue
         try:
-            assignments = _get(
+            assignments = _get_paginated(
                 f"{CANVAS_BASE_URL}/api/v1/courses/{c['id']}/assignments",
                 {"per_page": 100, "include[]": "submission", "order_by": "due_at"})
         except requests.RequestException as e:

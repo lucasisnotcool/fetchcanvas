@@ -52,9 +52,32 @@ def get_json(url):
         raise RuntimeError(f"Canvas returned invalid JSON for {url}") from e
 
 
+def get_json_paginated(url):
+    """Fetch EVERY page of a Canvas list endpoint.
+
+    Canvas paginates with RFC 5988 Link headers. Passing per_page=100 and reading a single
+    response silently drops everything past the first 100 rows with no error and no warning
+    — a course with 100+ files simply mirrors short. Fixed 2026-08-19; the server port in
+    projects/second-brain/scripts/canvas-upcoming.py has always done this correctly.
+    """
+    out = []
+    while url:
+        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        try:
+            page = response.json()
+        except ValueError as e:
+            raise RuntimeError(f"Canvas returned invalid JSON for {url}") from e
+        if not isinstance(page, list):
+            return page
+        out.extend(page)
+        url = response.links.get("next", {}).get("url")
+    return out
+
+
 def get_all_courses():
     url = f"{CANVAS_BASE_URL}/api/v1/courses?enrollment_state=active&per_page=100"
-    course_list = get_json(url)
+    course_list = get_json_paginated(url)
     courses = []
     for course in course_list:
         if "course_code" in course:
@@ -70,7 +93,7 @@ def get_all_folders(course_id, course_name):
     """
     url = f"{CANVAS_BASE_URL}/api/v1/courses/{course_id}/folders?per_page=100"
 
-    folder_list = get_json(url)
+    folder_list = get_json_paginated(url)
 
     folder_id_name_map = {}
     for folder in folder_list:
@@ -265,7 +288,7 @@ def resolve_path_for_file(folder_id, folder_id_name_map):
 
 def download_all_files(course_id, folder_id_name_map, course_code):
     url = f"{CANVAS_BASE_URL}/api/v1/courses/{course_id}/files?per_page=100"
-    file_list = get_json(url)
+    file_list = get_json_paginated(url)
 
     downloaded = []
     updated = []
