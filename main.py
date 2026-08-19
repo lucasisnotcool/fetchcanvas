@@ -29,6 +29,59 @@ LOCAL_STATE_DIR = Path.home() / ".fetchcanvas"
 PENDING_CHANGELOG_PATH = LOCAL_STATE_DIR / "pending-changelog.md"
 RUN_STATE_PATH = LOCAL_STATE_DIR / "last-run.json"
 
+# Course files land in the module's own OneDrive folder, not a single FetchCanvas tree:
+#   OneDrive/<COURSE>/FetchCanvas/<canvas folder path>/<file>
+# Rationale and the migration are in the dochub (2026-08-19 changelog). VAULT_ROOT is the
+# OneDrive root = the Obsidian vault root.
+VAULT_ROOT = os.getenv("VAULT_ROOT") or os.path.expanduser(
+    "~/Library/CloudStorage/OneDrive-NationalUniversityofSingapore")
+COURSE_SUBDIR = "FetchCanvas"
+
+# Files the user has deliberately moved OUT of <COURSE>/FetchCanvas/ must not reappear on the
+# next run. We remember the exact Canvas version we last wrote; if that same version is now
+# absent locally, it was moved on purpose. A NEW version from Canvas is still delivered.
+PUSH_STATE_PATH = LOCAL_STATE_DIR / "pushed-files.json"
+
+
+def _fs_safe(name):
+    """Course codes such as CS4246/CS5446 contain a slash and would nest a directory."""
+    return name.replace(os.sep, "-").replace("/", "-").strip()
+
+
+def load_push_state():
+    try:
+        with open(PUSH_STATE_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, ValueError, OSError):
+        return {}
+
+
+def save_push_state(state):
+    try:
+        LOCAL_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = PUSH_STATE_PATH.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=2, sort_keys=True)
+        os.replace(tmp, PUSH_STATE_PATH)
+    except OSError as e:
+        print(f"[push-state] could not persist {PUSH_STATE_PATH}: {e}")
+
+
+def destination_for(course_code, folder_path, display_name):
+    """OneDrive/<COURSE>/FetchCanvas/<subpath>/<file>.
+
+    folder_path arrives as "<course code>/<sub>/<sub>" because get_all_folders renames Canvas's
+    root 'course files' folder to the course code. Strip that first segment — it becomes the
+    top-level module directory instead.
+    """
+    parts = folder_path.split(os.sep) if folder_path else []
+    if parts and parts[0] == course_code:
+        parts = parts[1:]
+    course_dir = os.path.join(VAULT_ROOT, _fs_safe(course_code), COURSE_SUBDIR)
+    rel = os.path.join(*parts, display_name) if parts else display_name
+    return os.path.join(course_dir, rel), rel
+
 _raw_courses = (os.getenv('COURSES') or '').strip()
 if not _raw_courses or _raw_courses.lower() == 'all':
     SYNC_ALL_COURSES = True
@@ -293,12 +346,16 @@ def download_all_files(course_id, folder_id_name_map, course_code):
     downloaded = []
     updated = []
     skipped = []
+    moved_out = []
     failed = []
+    push_state = load_push_state()
 
     for file in file_list:
         display_name = file['filename']
         folder_path = resolve_path_for_file(file['folder_id'], folder_id_name_map)
-        save_path = os.path.join(OUTPUT_PATH, folder_path, display_name)
+        save_path, rel_key = destination_for(course_code, folder_path, display_name)
+        state_key = f"{course_code}/{rel_key}"
+        canvas_version = str(file.get('updated_at') or file.get('size') or '')
 
         try:
             local_stat = os.stat(save_path)
@@ -311,9 +368,21 @@ def download_all_files(course_id, folder_id_name_map, course_code):
             continue
 
         if not exists:
+            # Absent locally. If we previously delivered THIS EXACT Canvas version, the user
+            # moved or deleted it on purpose — respect that and do not resurrect it. A newer
+            # version from Canvas falls through and is delivered normally.
+            prior = push_state.get(state_key)
+            if prior and prior.get("canvas_version") == canvas_version:
+                moved_out.append((display_name, folder_path))
+                continue
             ok, err = download_file(file['url'], save_path)
             if ok:
                 downloaded.append((display_name, folder_path))
+                push_state[state_key] = {
+                    "canvas_version": canvas_version,
+                    "canvas_id": file.get("id"),
+                    "path": save_path,
+                }
             else:
                 failed.append((display_name, folder_path, err or "Unknown error"))
             continue
@@ -330,10 +399,22 @@ def download_all_files(course_id, folder_id_name_map, course_code):
             ok, err = download_file(file['url'], save_path)
             if ok:
                 updated.append((display_name, folder_path))
+                push_state[state_key] = {
+                    "canvas_version": canvas_version,
+                    "canvas_id": file.get("id"),
+                    "path": save_path,
+                }
             else:
                 failed.append((display_name, folder_path, err or "Unknown error"))
         else:
             skipped.append((display_name, folder_path))
+            push_state[state_key] = {
+                "canvas_version": canvas_version,
+                "canvas_id": file.get("id"),
+                "path": save_path,
+            }
+
+    save_push_state(push_state)
 
     # Optional: adjust console printing to show paths too
     print(f"\n--- {course_code} ---")
@@ -344,6 +425,10 @@ def download_all_files(course_id, folder_id_name_map, course_code):
     for name, folder in updated:
         print(f"  - {os.path.join(folder, name)}")
     print(f"Skipped (up to date): {len(skipped)}")
+    if moved_out:
+        print(f"Left alone (moved by you): {len(moved_out)}")
+        for name, folder in moved_out:
+            print(f"  - {os.path.join(folder, name)}")
     if failed:
         print(f"Failed:             {len(failed)}")
         for name, folder, err in failed:
@@ -354,6 +439,7 @@ def download_all_files(course_id, folder_id_name_map, course_code):
         "downloaded": downloaded,
         "updated": updated,
         "skipped": skipped,
+        "moved_out": moved_out,
         "failed": failed,
     }
 
