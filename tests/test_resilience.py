@@ -48,8 +48,7 @@ class MainResilienceTests(unittest.TestCase):
         clean = self.result(skipped=[("handout.pdf", "TEST101")])
         with patch.object(main, "SYNC_ALL_COURSES", True), \
              patch.object(main, "get_all_courses", return_value=[(1, "TEST101")]), \
-             patch.object(main, "get_all_folders", return_value={}), \
-             patch.object(main, "download_all_files", return_value=clean), \
+             patch.object(main, "sync_course", return_value=clean), \
              patch.object(main, "update_changelog") as update_changelog, \
              patch("fetch_upcoming.main", return_value={"ok": True, "error": None, "targets": []}):
             self.assertEqual(main.run(), 0)
@@ -62,8 +61,7 @@ class MainResilienceTests(unittest.TestCase):
         changed = self.result(downloaded=[("handout.pdf", "TEST101")])
         with patch.object(main, "SYNC_ALL_COURSES", True), \
              patch.object(main, "get_all_courses", return_value=[(1, "TEST101")]), \
-             patch.object(main, "get_all_folders", return_value={}), \
-             patch.object(main, "download_all_files", return_value=changed), \
+             patch.object(main, "sync_course", return_value=changed), \
              patch.object(main, "update_changelog", return_value=(False, "Resource deadlock avoided")), \
              patch("fetch_upcoming.main", return_value={"ok": True, "error": None, "targets": []}):
             self.assertEqual(main.run(), main.METADATA_DEFERRED_EXIT_CODE)

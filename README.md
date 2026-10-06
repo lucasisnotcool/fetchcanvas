@@ -13,6 +13,22 @@ Set these in `.env` (see `.env-sample`):
   but FetchCanvas's code and virtualenv must remain on local disk.
 - **COURSES** — Comma-separated course codes to sync (e.g. `CS3223,CS3234`), or `all` to sync every active course. Empty or missing = sync all.
 
+## What Gets Synced
+
+Each course lands in its own OneDrive folder: `<VAULT_ROOT>/<COURSE>/FetchCanvas/<Canvas folder path>/<file>`.
+
+- **Files** — everything the course's Files listing returns, in its Canvas folder structure.
+- **Modules** (from upstream) — files linked from a module that the Files listing does *not*
+  already return, in `FetchCanvas/Modules/<module name>/`. This is what catches courses whose
+  Files tab is hidden. A file in both places, or in several modules, is delivered once.
+- **Hidden areas** — a 401/403/404 on a course's folders, files or modules (or a locked module
+  file) is reported as "not visible to you" and skipped, not counted as a failure. Any other
+  Canvas or network error for a course is recorded as that course's failure and the run moves on.
+- **Names** — `<>"/\|?*` in Canvas names become `-` and leading/trailing dots and spaces are
+  trimmed. `:` is kept deliberately, so existing folders such as `Chapter 7: Prediction` keep
+  their paths. gram-server's `canvas-mirror.py` applies the same rule.
+- Files you move out of `FetchCanvas/` are not re-downloaded unless Canvas publishes a newer version.
+
 ## Reliability Model
 
 Course-file delivery is the core sync operation. The remote changelog and
@@ -33,3 +49,7 @@ Provider errors must not make a completed course sync look like a failure.
   required course-file delivery failures remain failures.
 
 See [MAC_AUTOMATION.md](MAC_AUTOMATION.md) for the LaunchAgent setup and logs.
+
+## Known Issues
+
+- ~~**Courses not found**~~ (upstream): fixed — a `COURSES` code that matches no active enrolment now prints a warning listing the active course codes.

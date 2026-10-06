@@ -43,9 +43,23 @@ COURSE_SUBDIR = "FetchCanvas"
 PUSH_STATE_PATH = LOCAL_STATE_DIR / "pushed-files.json"
 
 
-def _fs_safe(name):
-    """Course codes such as CS4246/CS5446 contain a slash and would nest a directory."""
-    return name.replace(os.sep, "-").replace("/", "-").strip()
+# From upstream (Jun Yu), minus ':' — the vault already holds NST2046 folders such as
+# "Chapter 7: Prediction", and replacing ':' would deliver every file in them a second time.
+# canvas-mirror.py on gram-server applies the identical rule so both sides agree on paths.
+_ILLEGAL_FS_CHARS = re.compile(r'[<>"/\\|?*]')
+
+# Canvas answers these when a course hides or disables an area (Files tab, Modules) for
+# students. That is a property of the course, not a failed sync: note it and skip the area.
+HIDDEN_AREA_STATUSES = (401, 403, 404)
+
+
+def sanitize_name(name):
+    """Replace filesystem-illegal characters and trim whitespace/dots.
+
+    Course codes such as CS4246/CS5446 contain a slash and would otherwise nest a directory.
+    """
+    name = _ILLEGAL_FS_CHARS.sub("-", name or "")
+    return name.strip(". ") or "unnamed"
 
 
 def load_push_state():
@@ -76,9 +90,9 @@ def destination_for(course_code, folder_path, display_name):
     top-level module directory instead.
     """
     parts = folder_path.split(os.sep) if folder_path else []
-    if parts and parts[0] == course_code:
+    if parts and parts[0] == sanitize_name(course_code):
         parts = parts[1:]
-    course_dir = os.path.join(VAULT_ROOT, _fs_safe(course_code), COURSE_SUBDIR)
+    course_dir = os.path.join(VAULT_ROOT, sanitize_name(course_code), COURSE_SUBDIR)
     rel = os.path.join(*parts, display_name) if parts else display_name
     return os.path.join(course_dir, rel), rel
 
@@ -128,6 +142,22 @@ def get_json_paginated(url):
     return out
 
 
+def get_optional(fetch, url, description, hidden_note):
+    """Fetch an area a course may hide. Returns None (after printing why) when it is hidden.
+
+    Any other HTTP or network error still raises: only "not visible to you" licenses a skip.
+    """
+    try:
+        return fetch(url)
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response is not None else None
+        if status not in HIDDEN_AREA_STATUSES:
+            raise
+        reason = e.response.reason if e.response is not None else ""
+        print(f"  {description}: {status} {reason}. {hidden_note}")
+        return None
+
+
 def get_all_courses():
     url = f"{CANVAS_BASE_URL}/api/v1/courses?enrollment_state=active&per_page=100"
     course_list = get_json_paginated(url)
@@ -146,7 +176,13 @@ def get_all_folders(course_id, course_name):
     """
     url = f"{CANVAS_BASE_URL}/api/v1/courses/{course_id}/folders?per_page=100"
 
-    folder_list = get_json_paginated(url)
+    folder_list = get_optional(
+        get_json_paginated, url, f"folders for {course_name} ({course_id})",
+        "Folders are not accessible (the course 'Files' area is often hidden); "
+        "files will be placed without their Canvas folder path.",
+    )
+    if folder_list is None:
+        return None
 
     folder_id_name_map = {}
     for folder in folder_list:
@@ -157,8 +193,8 @@ def get_all_folders(course_id, course_name):
         if folder_name == 'course files':
             folder_name = course_name
 
-        folder_id_name_map[folder_id] = (folder_name, parent_folder_id)
-    
+        folder_id_name_map[folder_id] = (sanitize_name(folder_name), parent_folder_id)
+
     return folder_id_name_map
 
 
@@ -261,6 +297,8 @@ def write_local_run_state(run_started_at, course_results, changelog_status, upco
                 "downloaded": len(result["downloaded"]),
                 "updated": len(result["updated"]),
                 "skipped": len(result["skipped"]),
+                "moved_out": len(result.get("moved_out", [])),
+                "hidden": len(result.get("hidden", [])),
                 "failed": len(result["failed"]),
             }
             for result in course_results
@@ -329,92 +367,184 @@ def resolve_path_for_file(folder_id, folder_id_name_map):
     given a file, resolve it's file path
     """
     path = []
+    seen = set()
 
-    while folder_id is not None:
+    # Stops at a folder the map does not know: with the folders area hidden the map is empty
+    # and the file lands at the course root instead of crashing the run.
+    while folder_id is not None and folder_id in folder_id_name_map and folder_id not in seen:
+        seen.add(folder_id)
         name, folder_id = folder_id_name_map[folder_id]
         path.append(name)
     
     path.reverse()
-    path = os.path.join(*path)
-    return path
+    return os.path.join(*path) if path else ""
 
 
-def download_all_files(course_id, folder_id_name_map, course_code):
+def new_course_result(course_code):
+    return {
+        "course_code": course_code,
+        "downloaded": [],
+        "updated": [],
+        "skipped": [],
+        "moved_out": [],
+        "failed": [],
+        "hidden": [],       # areas or module files Canvas does not show you (not a failure)
+        "file_ids": set(),  # Canvas ids the Files listing returned; Modules skips these
+    }
+
+
+def sync_file(file, folder_path, course_code, push_state, result):
+    """Deliver one Canvas file object into the course's OneDrive folder."""
+    display_name = sanitize_name(file.get('filename') or file.get('display_name'))
+    save_path, rel_key = destination_for(course_code, folder_path, display_name)
+    state_key = f"{course_code}/{rel_key}"
+    canvas_version = str(file.get('updated_at') or file.get('size') or '')
+    record = {
+        "canvas_version": canvas_version,
+        "canvas_id": file.get("id"),
+        "path": save_path,
+    }
+
+    if not file.get('url'):
+        result["failed"].append((display_name, folder_path, "No download url in file object"))
+        return
+
+    try:
+        local_stat = os.stat(save_path)
+        exists = True
+    except FileNotFoundError:
+        exists = False
+        local_stat = None
+    except OSError as e:
+        result["failed"].append((display_name, folder_path, str(e)))
+        return
+
+    if not exists:
+        # Absent locally. If we previously delivered THIS EXACT Canvas version, the user
+        # moved or deleted it on purpose — respect that and do not resurrect it. A newer
+        # version from Canvas falls through and is delivered normally.
+        prior = push_state.get(state_key)
+        if prior and prior.get("canvas_version") == canvas_version:
+            result["moved_out"].append((display_name, folder_path))
+            return
+        ok, err = download_file(file['url'], save_path)
+        if ok:
+            result["downloaded"].append((display_name, folder_path))
+            push_state[state_key] = record
+        else:
+            result["failed"].append((display_name, folder_path, err or "Unknown error"))
+        return
+
+    try:
+        canvas_updated = datetime.fromisoformat(
+            file['updated_at'].replace('Z', '+00:00')
+        ).timestamp()
+    except (KeyError, AttributeError, ValueError):
+        canvas_updated = float('inf')
+
+    local_mtime = local_stat.st_mtime
+    if canvas_updated > local_mtime:
+        ok, err = download_file(file['url'], save_path)
+        if ok:
+            result["updated"].append((display_name, folder_path))
+            push_state[state_key] = record
+        else:
+            result["failed"].append((display_name, folder_path, err or "Unknown error"))
+    else:
+        result["skipped"].append((display_name, folder_path))
+        push_state[state_key] = record
+
+
+def download_all_files(course_id, folder_id_name_map, course_code, push_state=None, result=None):
     url = f"{CANVAS_BASE_URL}/api/v1/courses/{course_id}/files?per_page=100"
-    file_list = get_json_paginated(url)
+    result = result if result is not None else new_course_result(course_code)
+    own_state = push_state is None
+    push_state = load_push_state() if own_state else push_state
 
-    downloaded = []
-    updated = []
-    skipped = []
-    moved_out = []
-    failed = []
-    push_state = load_push_state()
+    file_list = get_optional(
+        get_json_paginated, url, f"files for {course_code} ({course_id})",
+        "Files are not accessible (the course 'Files' tab is usually hidden); "
+        "only files linked from Modules will be synced.",
+    )
+    if file_list is None:
+        result["hidden"].append(("Files", "files listing hidden"))
+        file_list = []
 
     for file in file_list:
-        display_name = file['filename']
-        folder_path = resolve_path_for_file(file['folder_id'], folder_id_name_map)
-        save_path, rel_key = destination_for(course_code, folder_path, display_name)
-        state_key = f"{course_code}/{rel_key}"
-        canvas_version = str(file.get('updated_at') or file.get('size') or '')
+        result["file_ids"].add(file.get("id"))
+        folder_path = resolve_path_for_file(file.get('folder_id'), folder_id_name_map or {})
+        sync_file(file, folder_path, course_code, push_state, result)
 
-        try:
-            local_stat = os.stat(save_path)
-            exists = True
-        except FileNotFoundError:
-            exists = False
-            local_stat = None
-        except OSError as e:
-            failed.append((display_name, folder_path, str(e)))
+    if own_state:
+        save_push_state(push_state)
+    return result
+
+
+def download_module_files(course_id, course_code, push_state, result):
+    """Sync files linked from Modules that the Files listing did not already return.
+
+    From upstream (Jun Yu), narrowed: only module-ONLY files are fetched, so a course whose
+    Files tab is hidden still syncs, while a file that is in both places is not delivered
+    twice. They land in OneDrive/<COURSE>/FetchCanvas/Modules/<module name>/<file>, the same
+    path canvas-mirror.py uses on gram-server.
+    """
+    modules = get_optional(
+        get_json_paginated,
+        f"{CANVAS_BASE_URL}/api/v1/courses/{course_id}/modules?per_page=100",
+        f"modules for {course_code} ({course_id})",
+        "Modules are not accessible; modules sync will be skipped for this course.",
+    )
+    if modules is None:
+        result["hidden"].append(("Modules", "modules listing hidden"))
+        return result
+
+    seen_ids = set(result["file_ids"])
+    for module in modules:
+        module_name = sanitize_name(module.get('name'))
+        folder_path = os.path.join(sanitize_name(course_code), "Modules", module_name)
+        items = get_optional(
+            get_json_paginated,
+            f"{CANVAS_BASE_URL}/api/v1/courses/{course_id}/modules/{module['id']}/items?per_page=100",
+            f"items for module '{module_name}'",
+            "Skipping this module.",
+        )
+        if items is None:
+            result["hidden"].append((module_name, "module items hidden"))
             continue
 
-        if not exists:
-            # Absent locally. If we previously delivered THIS EXACT Canvas version, the user
-            # moved or deleted it on purpose — respect that and do not resurrect it. A newer
-            # version from Canvas falls through and is delivered normally.
-            prior = push_state.get(state_key)
-            if prior and prior.get("canvas_version") == canvas_version:
-                moved_out.append((display_name, folder_path))
+        for item in items:
+            if item.get('type') != 'File':
                 continue
-            ok, err = download_file(file['url'], save_path)
-            if ok:
-                downloaded.append((display_name, folder_path))
-                push_state[state_key] = {
-                    "canvas_version": canvas_version,
-                    "canvas_id": file.get("id"),
-                    "path": save_path,
-                }
-            else:
-                failed.append((display_name, folder_path, err or "Unknown error"))
-            continue
+            file_id = item.get('content_id')
+            if file_id in seen_ids:
+                continue  # already synced from Files, or linked from an earlier module
+            seen_ids.add(file_id)
 
-        try:
-            canvas_updated = datetime.fromisoformat(
-                file['updated_at'].replace('Z', '+00:00')
-            ).timestamp()
-        except (KeyError, ValueError):
-            canvas_updated = float('inf')
+            title = sanitize_name(item.get('title') or str(file_id))
+            if not item.get('url'):
+                result["failed"].append((title, folder_path, "No file API url in module item"))
+                continue
+            try:
+                file = get_optional(
+                    get_json, item['url'], f"file '{title}' in module '{module_name}'",
+                    "It is locked or hidden; skipping.",
+                )
+            except (requests.exceptions.RequestException, RuntimeError) as e:
+                result["failed"].append((title, folder_path, str(e)))
+                continue
+            if file is None:
+                result["hidden"].append((os.path.join(module_name, title), "file locked or hidden"))
+                continue
+            sync_file(file, folder_path, course_code, push_state, result)
 
-        local_mtime = local_stat.st_mtime
-        if canvas_updated > local_mtime:
-            ok, err = download_file(file['url'], save_path)
-            if ok:
-                updated.append((display_name, folder_path))
-                push_state[state_key] = {
-                    "canvas_version": canvas_version,
-                    "canvas_id": file.get("id"),
-                    "path": save_path,
-                }
-            else:
-                failed.append((display_name, folder_path, err or "Unknown error"))
-        else:
-            skipped.append((display_name, folder_path))
-            push_state[state_key] = {
-                "canvas_version": canvas_version,
-                "canvas_id": file.get("id"),
-                "path": save_path,
-            }
+    return result
 
-    save_push_state(push_state)
+
+def print_course_result(result):
+    course_code = result["course_code"]
+    downloaded, updated = result["downloaded"], result["updated"]
+    moved_out, failed = result["moved_out"], result["failed"]
+    hidden = result.get("hidden", [])
 
     # Optional: adjust console printing to show paths too
     print(f"\n--- {course_code} ---")
@@ -424,24 +554,35 @@ def download_all_files(course_id, folder_id_name_map, course_code):
     print(f"Updated (replaced):  {len(updated)}")
     for name, folder in updated:
         print(f"  - {os.path.join(folder, name)}")
-    print(f"Skipped (up to date): {len(skipped)}")
+    print(f"Skipped (up to date): {len(result['skipped'])}")
     if moved_out:
         print(f"Left alone (moved by you): {len(moved_out)}")
         for name, folder in moved_out:
             print(f"  - {os.path.join(folder, name)}")
+    if hidden:
+        print(f"Not visible to you:  {len(hidden)}")
+        for what, why in hidden:
+            print(f"  - {what}: {why}")
     if failed:
         print(f"Failed:             {len(failed)}")
         for name, folder, err in failed:
             print(f"  - {os.path.join(folder, name)}: {err}")
 
-    return {
-        "course_code": course_code,
-        "downloaded": downloaded,
-        "updated": updated,
-        "skipped": skipped,
-        "moved_out": moved_out,
-        "failed": failed,
-    }
+
+def sync_course(course_id, course_code):
+    """Files, then module-only files, for one course. Never raises for a Canvas/network error:
+    one unreachable course is recorded as a failure instead of aborting every other course."""
+    result = new_course_result(course_code)
+    push_state = load_push_state()
+    try:
+        folder_id_name_map = get_all_folders(course_id, course_code)
+        download_all_files(course_id, folder_id_name_map, course_code, push_state, result)
+        download_module_files(course_id, course_code, push_state, result)
+    except (requests.exceptions.RequestException, RuntimeError) as e:
+        result["failed"].append(("(course listing)", course_code, str(e)))
+    save_push_state(push_state)
+    print_course_result(result)
+    return result
 
 
 def format_course_summary(course_result):
@@ -474,6 +615,21 @@ def format_course_summary(course_result):
 
     return lines
 
+def warn_unmatched_courses(courses):
+    """Upstream's Known Issue: a COURSES typo, or a course you are no longer enrolled in,
+    used to sync nothing for it without a word."""
+    if SYNC_ALL_COURSES:
+        return []
+    enrolled = {code for _, code in courses}
+    unmatched = sorted(COURSE_CODES - enrolled)
+    if unmatched:
+        print(f"Warning: COURSES lists {', '.join(unmatched)}, which match(es) no active "
+              f"enrolment. Active course codes: {', '.join(sorted(enrolled)) or 'none'}")
+    if not COURSE_CODES & enrolled:
+        print("Warning: no configured course matched; nothing will be synced.")
+    return unmatched
+
+
 def run():
     if not OUTPUT_PATH:
         raise RuntimeError("OUTPUT_PATH is missing from .env")
@@ -482,6 +638,7 @@ def run():
     courses = get_all_courses()
 
     print(f"Syncing courses: {COURSE_CODES if not SYNC_ALL_COURSES else 'all'}")
+    warn_unmatched_courses(courses)
 
     courses_log = []
     course_results = []
@@ -492,8 +649,7 @@ def run():
             continue
 
         print(f"\nCourse: {course_code}")
-        folder_id_name_map = get_all_folders(course_id, course_code)
-        result = download_all_files(course_id, folder_id_name_map, course_code)
+        result = sync_course(course_id, course_code)
         course_results.append(result)
         summary_lines = format_course_summary(result)
 

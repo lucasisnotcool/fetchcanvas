@@ -1,5 +1,13 @@
 # macOS Automation
 
+> **Since 2026-08-19 the hourly LaunchAgent no longer runs this repo.** gram-server's
+> `canvas-mirror.py` fetches from Canvas (same file/module/naming rules as `main.py`), and
+> `~/bin/fetchcanvas_startup.sh` now runs `~/bin/canvas-deliver.py`, which pulls that mirror
+> and places files into `OneDrive/<COURSE>/FetchCanvas/`. Its log is
+> `~/Library/Logs/fetchcanvas.log`. Source and rationale live in `~/gram-server-setup`
+> (`projects/second-brain/scripts/`, decision #27). `main.py` remains the standalone/manual
+> fetcher. The sections below describe the LaunchAgent itself, which is unchanged.
+
 FetchCanvas is scheduled with a per-user macOS LaunchAgent.
 
 ## Where It Is Configured
